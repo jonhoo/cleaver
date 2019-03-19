@@ -1,5 +1,5 @@
 use petgraph::graph::NodeIndex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 type DomainIndex = usize;
 
@@ -28,11 +28,15 @@ impl Tmp {
     fn lookup_in(&self) -> impl Iterator<Item = (NodeIndex, usize)> {
         Vec::new().into_iter()
     }
-    fn source_of(&self, _col: usize) -> impl Iterator<Item = (NodeIndex, usize)> {
+    fn source_of(&self, _col: usize) -> impl Iterator<Item = (NodeIndex, Option<usize>)> {
         Vec::new().into_iter()
     }
     fn mirror(&self) -> Self {
         self.clone()
+    }
+    fn rewire(&mut self, _ancestor: NodeIndex, _to: NodeIndex) {}
+    fn is_base(&self) -> bool {
+        false
     }
 }
 
@@ -62,24 +66,32 @@ impl State {
 
 pub struct Migration<'a> {
     graph: petgraph::Graph<Node, Edge>,
+
+    // we want to preserve add order so that we can cheaply iterate in topological order
     added: HashSet<NodeIndex>,
+
     state: &'a mut State,
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
 }
 
 impl<'a> Migration<'a> {
-    fn resolve(&self, mut ni: NodeIndex, mut column: usize) -> (NodeIndex, usize) {
+    fn resolve_for_lookup(&self, mut ni: NodeIndex, mut column: usize) -> (NodeIndex, usize) {
         loop {
             // canonicalize by always choosing smaller node index
-            match self.graph[ni].source_of(column).min_by_key(|(pi, _)| *pi) {
+            match self.graph[ni]
+                .source_of(column)
+                .filter_map(|(pi, col)| col.map(move |col| (pi, col)))
+                .min_by_key(|(pi, _)| *pi)
+            {
                 Some((pi, pc)) => {
                     ni = pi;
                     column = pc;
                 }
-                None => {
+                None if self.graph[ni].is_base() => {
                     return (ni, column);
                 }
+                None => unreachable!("looking up into column that does not exist"),
             }
         }
     }
@@ -94,14 +106,14 @@ impl<'a> Migration<'a> {
             // sharded the same way as the join itself.
             if let Some((neighbor, column)) = self.graph[ni].lookup_in().min_by_key(|(i, _)| *i) {
                 self.assigned_sharding
-                    .insert(ni, self.resolve(neighbor, column));
+                    .insert(ni, self.resolve_for_lookup(neighbor, column));
             }
 
             // we'll also register a desire to have the lookup targets sharded by the key we look
             // up by.
             for (neighbor, column) in self.graph[ni].lookup_in() {
                 if self.added.contains(&neighbor) && neighbor != ni {
-                    let wants = self.resolve(neighbor, column);
+                    let wants = self.resolve_for_lookup(neighbor, column);
                     desired_sharding
                         .entry(neighbor)
                         .or_insert_with(HashSet::new)
@@ -188,7 +200,8 @@ impl<'a> Migration<'a> {
 
                 materializations
                     .entry(neighbor)
-                    .or_insert_with(HashSet::new)
+                    .or_insert_with(Materialization::default)
+                    .keys
                     .insert(column);
             }
         }
@@ -198,11 +211,11 @@ impl<'a> Migration<'a> {
         // the materialization for each other sharding.
         let mut resharded_copy = Vec::new();
         // TODO: only look at new?
-        for (&ni, columns) in &mut materializations {
+        for (&ni, mat) in &mut materializations {
             if let Some(sharding) = self.assigned_sharding.get(&ni) {
                 // self is sharded -- check for any incompatible indices
-                columns.retain(|&column| {
-                    let want = self.resolve(ni, column);
+                mat.keys.retain(|&column| {
+                    let want = self.resolve_for_lookup(ni, column);
                     if *sharding != want {
                         // we'll need re-sharded copy of this state
                         resharded_copy.push((ni, column, want));
@@ -213,17 +226,46 @@ impl<'a> Migration<'a> {
                 });
             }
         }
+        // it's time to insert the identity nodes.
+        // one thing to keep in mind though is that we'll want to do topological iterations over
+        // the new nodes further down. normally, we could just iterate over the new nodes in order
+        // of their node id (since a child must be added after its parent, and would thus get a
+        // larger id), but that becomes tricky when we inject nodes into the _middle_ of the graph.
+        // to fix this, we construct a heap that initially holds every node index with a weight
+        // equal to its node id, and whenever we add an identity node, we insert its node index
+        // with a weight slightly larger than the node index of the node it is copying! that way,
+        // topological traversal is simply a matter of traversing the heap in order by weight,
+        // which heaps are great at.
+        let mut topo = BinaryHeap::new();
+        for &ni in &self.added {
+            topo.push(VisitNode {
+                logical: (ni, 0),
+                index: ni,
+            });
+        }
         for (ni, column, want) in resharded_copy {
             // create a materialized identity node of ni that is sharded by the lookup key (column)
             // TODO: make sure to also unmark existing node as changed if applicable
             let mirror = self.graph[ni].mirror();
             let mni = self.graph.add_node(mirror);
+            // NOTE: we don't need to remove from materializations[ni], b/c of retain above.
             materializations
                 .entry(mni)
-                .or_insert_with(HashSet::new)
+                .or_insert_with(Materialization::default)
+                .keys
                 .insert(column);
             let ei = self.graph.add_edge(ni, mni, Sharding::from(want));
             maybe_shuffle.push(ei);
+            self.added.insert(mni);
+
+            // also keep track of it in the heap so we'll iterate over it.
+            // weight should be half-way between that of the node we're copying and the next node.
+            // NOTE: in this particular case, we know that there are no other copies of ni below
+            // mni, so it's fine to just use half the space!
+            topo.push(VisitNode {
+                logical: (ni, usize::max_value() >> 1),
+                index: mni,
+            });
 
             // rewire any outgoing edges from ni that required sharding by column
             // so that they instead link to the re-sharded mirror
@@ -240,6 +282,7 @@ impl<'a> Migration<'a> {
                 let ei = self.graph.find_edge(ni, child).unwrap();
                 let e = self.graph.remove_edge(ei).unwrap();
                 self.graph.add_edge(mni, child, e);
+                self.graph[child].rewire(ni, mni);
             }
             // TODO: maybe_shuffle is invalidated by the remove_edges above
         }
@@ -248,13 +291,167 @@ impl<'a> Migration<'a> {
         // next step now is to figure out which of them we can make partial.
         // in the process, we also want to resolve all the sharding decisions that are in
         // "arbitrary sharding".
-        //
-        // TODO: we probably have to re-do the work of splitting materializations once all
-        // arbitrary shardings have been resolved :/ can we structure this in a better way?
 
-        // TODO
+        // we have to walk the graph from the leaves and up, since we are not allowed to create
+        // partial materializations "above" (closer to the base tables than) full materializations.
+        // the heap we've maintained will give us reverse topological order (i.e., leaves-up),
+        // which is exactly what we want.
+        let mut candidates = VecDeque::new();
+        while let Some(VisitNode {
+            logical: _,
+            index: ni,
+        }) = topo.pop()
+        {
+            if let Some(materialization) = materializations.get_mut(&ni) {
+                if let Some(is_full) = materialization.is_full {
+                    // materialization state has already been determined!
+                    // that can only be the case if we have already determined it needs to be full.
+                    assert!(is_full);
+                    continue;
+                }
+
+                // there needs to be a replay path to each of the materialization's columns. for
+                // that to be the case for a column, the column needs to exist in at least one
+                // upstream materialization (all through a union, one through a join). if that is
+                // not the case, all upstream materializations need to be marked as full!
+                for &column in &materialization.keys {
+                    // we're going to keep track of all the upquery paths we're considering.
+                    // each candidate is really a _set_ of paths, since a union can cause an
+                    // upquery to have to branch through _multiple_ paths. if _any_ path in a
+                    // candidate can't resolve the upquery column, that candidate is removed.
+                    // if _all_ the paths in a candidate terminate in a materialization, then that
+                    // candidate is viable. we continue resolving columns until all candidates are
+                    // viable.
+                    assert!(candidates.is_empty());
+                    candidates.push_back(VecDeque::from(vec![vec![(ni, column)]]));
+                    'candidate: while let Some(mut candidate) = candidates.pop_front() {
+                        // check the next path in this candidate
+                        let path = candidate.pop_front().expect("candidate had no paths?");
+
+                        // we want to extend the path to get to a materialization, which we do
+                        // by resolving the last (node, column) pair we got to.
+                        let (lni, lcol) = path.last().cloned().unwrap();
+                        if materializations.contains_key(&lni) {
+                            // this path already terminates
+                            // TODO: how do we detect termination?
+                            // TODO: only stop at _full_ materializations to aid in adding indices?
+                            candidate.push_back(path);
+                            candidates.push_back(candidate);
+                            continue;
+                        } else {
+                            let required_ancestors: Option<HashSet<NodeIndex>> = None;
+                            if let Some(required_ancestors) = required_ancestors {
+                                // lni is a join -- add all resolve paths _as_ candidates
+                                // because the column can resolve in any of them.
+                                for (pni, pcol) in self.graph[lni].source_of(lcol) {
+                                    if !required_ancestors.contains(&pni) {
+                                        continue;
+                                    }
+
+                                    if let Some(pcol) = pcol {
+                                        let mut npath = path.clone();
+                                        npath.push((pni, pcol));
+                                        let mut ncandidate = candidate.clone();
+                                        ncandidate.push_back(npath);
+                                        candidates.push_back(ncandidate);
+                                    }
+                                }
+                            } else {
+                                // lni is a union -- add all resolve paths _to_ candidate
+                                // because the column needs to resolve in all of them.
+                                for (pni, pcol) in self.graph[lni].source_of(lcol) {
+                                    if let Some(pcol) = pcol {
+                                        let mut npath = path.clone();
+                                        npath.push((pni, pcol));
+                                        candidate.push_back(npath);
+                                    } else {
+                                        // we can't resolve the column any further in this
+                                        // ancestor, so this candidate isn't viable.
+                                        continue 'candidate;
+                                    }
+                                }
+                                candidates.push_back(candidate);
+                            }
+                        }
+                    }
+
+                    // once the loop above has terminated, we should end up with a set of candidate
+                    // upquery paths in `candidates`. if `candidates` is empty, then this
+                    // materialization must be full, and so must any of its ancestors.
+                    if candidates.is_empty() {
+                        // mark as full, and mark all ancestors as full
+                        // TODO
+                    } else {
+                        // we can pick any of the sets of paths in `candidates`.
+                        // let's choose whichever one requires fewer upqueries.
+                        // TODO
+                        // TODO: also resolve arbitrary_sharding
+                        // TODO: also add any additional indices we now need (recursively)
+                        // TODO: can we detect join eviction cases here too?
+                    }
+                }
+            }
+        }
 
         let arbitrary_sharding = arbitrary_sharding;
         let maybe_shuffle = maybe_shuffle;
+    }
+}
+
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, PartialEq, Eq)]
+struct VisitNode {
+    logical: (NodeIndex, usize),
+    index: NodeIndex,
+}
+
+#[derive(Default, Debug, Clone)]
+struct Materialization {
+    is_full: Option<bool>,
+    keys: HashSet<usize>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn visitnode_order() {
+        let a = VisitNode {
+            logical: (NodeIndex::from(1), 0),
+            index: NodeIndex::from(1),
+        };
+        let b = VisitNode {
+            logical: (NodeIndex::from(2), 0),
+            index: NodeIndex::from(2),
+        };
+        // insert x between a and b
+        let x = VisitNode {
+            logical: (NodeIndex::from(1), usize::max_value() / 2),
+            index: NodeIndex::from(3),
+        };
+        // insert y between a and x
+        let y = VisitNode {
+            logical: (NodeIndex::from(1), usize::max_value() / 2 / 2),
+            index: NodeIndex::from(4),
+        };
+        // insert z between x and b
+        let z = VisitNode {
+            logical: (NodeIndex::from(1), 3 * (usize::max_value() / 2 / 2)),
+            index: NodeIndex::from(5),
+        };
+
+        // we want to do a reverse topological search using a heap
+        let mut heap = BinaryHeap::new();
+        heap.push(a);
+        heap.push(b);
+        heap.push(x);
+        heap.push(y);
+        heap.push(z);
+        let mut got = Vec::new();
+        while let Some(o) = heap.pop() {
+            got.push(o);
+        }
+        let topo = vec![b, z, x, y, a];
+        assert_eq!(got, topo);
     }
 }
