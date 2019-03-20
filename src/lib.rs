@@ -128,8 +128,8 @@ impl<'a> Migration<'a> {
         // nodes that should be sharded, but we have to decide how
         let mut arbitrary_sharding = HashMap::new();
 
-        // edges where we may have to inject a shuffle
-        let mut maybe_shuffle = Vec::new();
+        // edges where we have to inject a shuffle
+        let mut shuffles = Vec::new();
 
         // next, we try to figure out how to shard nodes that have lookups into them.
         // we only assign shardings to the ones where there's no conflict for the time being.
@@ -141,18 +141,14 @@ impl<'a> Migration<'a> {
                         // no conflict here!
                     } else {
                         // lookup target is sharded one way, and at least one child requires a
-                        // different sharding. we can pick any of them, and would have to shuffle
-                        // for the others.
-                        arbitrary_sharding.insert(ni, shardings);
-
-                        // mark all outgoing edges as "may require resharding"
+                        // different sharding, so we need to shuffle.
                         for child in self.graph.edges_directed(ni, petgraph::Direction::Outgoing) {
                             let (i, col) = *s.get();
                             match *child.weight() {
                                 Sharding::By(ci, ccol) if ci == i && ccol == col => {}
                                 _ => {
                                     use petgraph::visit::EdgeRef;
-                                    maybe_shuffle.push(child.id());
+                                    shuffles.push((ni, child.target()));
                                 }
                             }
                         }
@@ -166,14 +162,6 @@ impl<'a> Migration<'a> {
                         // multiple children who do lookups based on different columns
                         // we'll have to pick one, and then do shuffles for the others
                         arbitrary_sharding.insert(ni, shardings);
-
-                        // mark all outgoing edges as "may require resharding"
-                        for child in self.graph.edges_directed(ni, petgraph::Direction::Outgoing) {
-                            if let Sharding::By(..) = *child.weight() {
-                                use petgraph::visit::EdgeRef;
-                                maybe_shuffle.push(child.id());
-                            }
-                        }
                     }
                 }
             }
@@ -254,8 +242,8 @@ impl<'a> Migration<'a> {
                 .or_insert_with(Materialization::default)
                 .keys
                 .insert(column);
-            let ei = self.graph.add_edge(ni, mni, Sharding::from(want));
-            maybe_shuffle.push(ei);
+            self.graph.add_edge(ni, mni, Sharding::from(want));
+            shuffles.push((ni, mni));
             self.added.insert(mni);
 
             // also keep track of it in the heap so we'll iterate over it.
@@ -284,7 +272,6 @@ impl<'a> Migration<'a> {
                 self.graph.add_edge(mni, child, e);
                 self.graph[child].rewire(ni, mni);
             }
-            // TODO: maybe_shuffle is invalidated by the remove_edges above
         }
 
         // we now have all the materializations we want in place.
@@ -303,10 +290,10 @@ impl<'a> Migration<'a> {
         }) = topo.pop()
         {
             if let Some(materialization) = materializations.get_mut(&ni) {
-                if let Some(is_full) = materialization.is_full {
+                if let Some(ref plan) = materialization.plan {
                     // materialization state has already been determined!
                     // that can only be the case if we have already determined it needs to be full.
-                    assert!(is_full);
+                    assert!(plan.is_full());
                     continue;
                 }
 
@@ -328,50 +315,51 @@ impl<'a> Migration<'a> {
                         // check the next path in this candidate
                         let path = candidate.pop_front().expect("candidate had no paths?");
 
-                        // we want to extend the path to get to a materialization, which we do
-                        // by resolving the last (node, column) pair we got to.
+                        // we want to extend the path to get to a full materialization, which we do
+                        // by continuously resolving the last (node, column) pair we got to.
                         let (lni, lcol) = path.last().cloned().unwrap();
-                        if materializations.contains_key(&lni) {
-                            // this path already terminates
-                            // TODO: how do we detect termination?
-                            // TODO: only stop at _full_ materializations to aid in adding indices?
-                            candidate.push_back(path);
-                            candidates.push_back(candidate);
-                            continue;
-                        } else {
-                            let required_ancestors: Option<HashSet<NodeIndex>> = None;
-                            if let Some(required_ancestors) = required_ancestors {
-                                // lni is a join -- add all resolve paths _as_ candidates
-                                // because the column can resolve in any of them.
-                                for (pni, pcol) in self.graph[lni].source_of(lcol) {
-                                    if !required_ancestors.contains(&pni) {
-                                        continue;
-                                    }
-
-                                    if let Some(pcol) = pcol {
-                                        let mut npath = path.clone();
-                                        npath.push((pni, pcol));
-                                        let mut ncandidate = candidate.clone();
-                                        ncandidate.push_back(npath);
-                                        candidates.push_back(ncandidate);
-                                    }
-                                }
-                            } else {
-                                // lni is a union -- add all resolve paths _to_ candidate
-                                // because the column needs to resolve in all of them.
-                                for (pni, pcol) in self.graph[lni].source_of(lcol) {
-                                    if let Some(pcol) = pcol {
-                                        let mut npath = path.clone();
-                                        npath.push((pni, pcol));
-                                        candidate.push_back(npath);
-                                    } else {
-                                        // we can't resolve the column any further in this
-                                        // ancestor, so this candidate isn't viable.
-                                        continue 'candidate;
-                                    }
-                                }
+                        if let Some(mat) = materializations.get(&lni) {
+                            if let Some(true) = mat.is_full() {
+                                // this path is already complete
+                                // TODO: how do we detect termination?
+                                candidate.push_back(path);
                                 candidates.push_back(candidate);
+                                continue;
                             }
+                        }
+
+                        let required_ancestors: Option<HashSet<NodeIndex>> = None;
+                        if let Some(required_ancestors) = required_ancestors {
+                            // lni is a join -- add all resolve paths _as_ candidates
+                            // because the column can resolve in any of them.
+                            for (pni, pcol) in self.graph[lni].source_of(lcol) {
+                                if !required_ancestors.contains(&pni) {
+                                    continue;
+                                }
+
+                                if let Some(pcol) = pcol {
+                                    let mut npath = path.clone();
+                                    npath.push((pni, pcol));
+                                    let mut ncandidate = candidate.clone();
+                                    ncandidate.push_back(npath);
+                                    candidates.push_back(ncandidate);
+                                }
+                            }
+                        } else {
+                            // lni is a union -- add all resolve paths _to_ candidate
+                            // because the column needs to resolve in all of them.
+                            for (pni, pcol) in self.graph[lni].source_of(lcol) {
+                                if let Some(pcol) = pcol {
+                                    let mut npath = path.clone();
+                                    npath.push((pni, pcol));
+                                    candidate.push_back(npath);
+                                } else {
+                                    // we can't resolve the column any further in this
+                                    // ancestor, so this candidate isn't viable.
+                                    continue 'candidate;
+                                }
+                            }
+                            candidates.push_back(candidate);
                         }
                     }
 
@@ -379,22 +367,156 @@ impl<'a> Migration<'a> {
                     // upquery paths in `candidates`. if `candidates` is empty, then this
                     // materialization must be full, and so must any of its ancestors.
                     if candidates.is_empty() {
-                        // mark as full, and mark all ancestors as full
-                        // TODO
+                        // mark as full, and mark all ancestor materializations as full
+                        let mut visit = vec![ni];
+                        while let Some(ni) = visit.pop() {
+                            if let Some(mat) = materializations.get_mut(&ni) {
+                                if !self.added.contains(&ni)
+                                    && !mat
+                                        .is_full()
+                                        .expect("existing materialization without a plan")
+                                {
+                                    unimplemented!(
+                                        "forced to turn existing partial materialization full"
+                                    );
+                                }
+
+                                mat.plan = Some(MaterializationPlan::Full);
+                            }
+
+                            visit.extend(
+                                self.graph
+                                    .neighbors_directed(ni, petgraph::Direction::Incoming),
+                            );
+                        }
+
+                        assert_eq!(materialization.plan, None);
+                        materialization.plan = Some(MaterializationPlan::Full);
                     } else {
                         // we can pick any of the sets of paths in `candidates`.
-                        // let's choose whichever one requires fewer upqueries.
-                        // TODO
-                        // TODO: also resolve arbitrary_sharding
-                        // TODO: also add any additional indices we now need (recursively)
-                        // TODO: can we detect join eviction cases here too?
+                        let mut chosen = None;
+                        for candidate in candidates.drain(..) {
+                            // how expensive is this candidate?
+                            // compute based on
+                            //
+                            //   a) # shard crossings (fan-out is expensive)
+                            //   b) # of paths (more upqueries)
+                            //   c) # of materialization on paths (more recursive upqueries)
+                            //
+                            // TODO
+                            chosen = Some(candidate);
+                        }
+
+                        assert_eq!(materialization.plan, None);
+                        materialization.plan = Some(MaterializationPlan::Partial {
+                            paths: chosen.expect("!candidates.is_empty()"),
+                        });
+
+                        // TODO: when we announce this plan, we have to announce it in segments!
                     }
                 }
             }
         }
 
-        let arbitrary_sharding = arbitrary_sharding;
-        let maybe_shuffle = maybe_shuffle;
+        // for each new partial materialization, we need to recursively add any new indices that
+        // path requires. as part of that, we should also truncate replay paths to the nearest full
+        // materialization. while the candidate-finding code does do that already, _new_
+        // materializations along a chosen replay path may also have been made full _after_ the
+        // path was chosen.
+        for &ni in &self.added {
+            if let Some(Materialization {
+                plan: Some(MaterializationPlan::Partial { ref mut paths }),
+                ..
+            }) = materializations.get_mut(&ni)
+            {
+                for path in paths {
+                    // each path _starts_ with the materialization at ni, and ends in _some_ full
+                    // materialization. in other words, it starts towards the leaves of the graph,
+                    // and ends closer to the root.
+                    //
+                    // we _first_ want to trim the suffix from the first full materialization:
+                    let first_full = path
+                        .iter()
+                        .position(|(ni, _)| {
+                            if let Some(Materialization {
+                                plan: Some(MaterializationPlan::Full),
+                                ..
+                            }) = materializations.get(&ni)
+                            {
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .expect("no full materialization on chosen replay path");
+                    path.truncate(first_full + 1);
+
+                    // next, we have to add any indices mandated by the new replay path
+                    for &mut (ni, col) in path {
+                        if let Some(mat) = materializations.get_mut(&ni) {
+                            if mat.keys.insert(col) && self.assigned_sharding.contains_key(&ni) {
+                                // I _think_ this is the join eviction case?
+                                // TODO
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // we still have some operators that there are conflicting sharding requirements on.
+        // let's resolve them randomly but deterministically for the time being:
+        for (ni, shardings) in arbitrary_sharding {
+            let sharding = shardings.into_iter().min().unwrap();
+            if let Some(sharding) = self.assigned_sharding.insert(ni, sharding) {
+                unreachable!(
+                    "thought we had to shard {:?}, but was already sharded by {:?}",
+                    ni, sharding
+                );
+            }
+
+            for child in self.graph.edges_directed(ni, petgraph::Direction::Outgoing) {
+                let (i, col) = sharding;
+                match *child.weight() {
+                    Sharding::By(ci, ccol) if ci == i && ccol == col => {}
+                    _ => {
+                        use petgraph::visit::EdgeRef;
+                        shuffles.push((ni, child.target()));
+                    }
+                }
+            }
+        }
+        let shuffles = shuffles;
+
+        // we still have some operators that we haven't decided on the sharding of. these are
+        // likely operators like filters, projections, and the like, which don't care how they're
+        // sharded. we still have to assign them a sharding.
+        let mut unassigned: Vec<_> = self
+            .added
+            .iter()
+            .filter(|ni| self.assigned_sharding.contains_key(ni))
+            .cloned()
+            .collect();
+        while !unassigned.is_empty() {
+            unassigned.retain(|&ni| {
+                // let's, for the time being, simply assign the sharding of a random parent.
+                let psharding = self
+                    .graph
+                    .neighbors_directed(ni, petgraph::Direction::Incoming)
+                    .filter_map(|pni| self.assigned_sharding.get(&pni))
+                    .cloned()
+                    .next();
+                if let Some(psharding) = psharding {
+                    self.assigned_sharding.insert(ni, psharding);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        // TODO: handle shuffles: maybe this is where we decide _not_ to shard?
+        // NOTE: if we un-shard, we can also suddenly keep more than one key in one mat.
     }
 }
 
@@ -404,10 +526,34 @@ struct VisitNode {
     index: NodeIndex,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
 struct Materialization {
-    is_full: Option<bool>,
     keys: HashSet<usize>,
+    plan: Option<MaterializationPlan>,
+}
+
+impl Materialization {
+    fn is_full(&self) -> Option<bool> {
+        self.plan.as_ref().map(|p| p.is_full())
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum MaterializationPlan {
+    Full,
+    Partial {
+        paths: VecDeque<Vec<(NodeIndex, usize)>>,
+    },
+}
+
+impl MaterializationPlan {
+    fn is_full(&self) -> bool {
+        if let MaterializationPlan::Full = *self {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
