@@ -125,9 +125,6 @@ impl<'a> Migration<'a> {
             }
         }
 
-        // nodes that should be sharded, but we have to decide how
-        let mut arbitrary_sharding = HashMap::new();
-
         // edges where we have to inject a shuffle
         let mut shuffles = Vec::new();
 
@@ -159,9 +156,25 @@ impl<'a> Migration<'a> {
                         // no conflicting sharding, so we can just go ahead and shard
                         e.insert(shardings.into_iter().next().unwrap());
                     } else {
-                        // multiple children who do lookups based on different columns
-                        // we'll have to pick one, and then do shuffles for the others
-                        arbitrary_sharding.insert(ni, shardings);
+                        // multiple children who do lookups based on different columns.
+                        // we'll have to pick one, and then do shuffles for the others.
+                        // TODO: choose more intelligently?
+                        let sharding = shardings
+                            .into_iter()
+                            .min()
+                            .expect("no shardings needed, why is the entry there?");
+                        e.insert(sharding);
+
+                        for child in self.graph.edges_directed(ni, petgraph::Direction::Outgoing) {
+                            let (i, col) = sharding;
+                            match *child.weight() {
+                                Sharding::By(ci, ccol) if ci == i && ccol == col => {}
+                                _ => {
+                                    use petgraph::visit::EdgeRef;
+                                    shuffles.push((ni, child.target()));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -276,8 +289,7 @@ impl<'a> Migration<'a> {
 
         // we now have all the materializations we want in place.
         // next step now is to figure out which of them we can make partial.
-        // in the process, we also want to resolve all the sharding decisions that are in
-        // "arbitrary sharding".
+        let shuffles = shuffles; // no more shuffles can be added
 
         // we have to walk the graph from the leaves and up, since we are not allowed to create
         // partial materializations "above" (closer to the base tables than) full materializations.
@@ -289,11 +301,12 @@ impl<'a> Migration<'a> {
             index: ni,
         }) = topo.pop()
         {
-            if let Some(materialization) = materializations.get_mut(&ni) {
+            if let Some(mut materialization) = materializations.remove(&ni) {
                 if let Some(ref plan) = materialization.plan {
                     // materialization state has already been determined!
                     // that can only be the case if we have already determined it needs to be full.
                     assert!(plan.is_full());
+                    materializations.insert(ni, materialization);
                     continue;
                 }
 
@@ -415,6 +428,7 @@ impl<'a> Migration<'a> {
                         // TODO: when we announce this plan, we have to announce it in segments!
                     }
                 }
+                materializations.insert(ni, materialization);
             }
         }
 
@@ -425,11 +439,11 @@ impl<'a> Migration<'a> {
         // path was chosen.
         for &ni in &self.added {
             if let Some(Materialization {
-                plan: Some(MaterializationPlan::Partial { ref mut paths }),
-                ..
-            }) = materializations.get_mut(&ni)
+                plan: Some(MaterializationPlan::Partial { mut paths }),
+                keys,
+            }) = materializations.remove(&ni)
             {
-                for path in paths {
+                for path in &mut paths {
                     // each path _starts_ with the materialization at ni, and ends in _some_ full
                     // materialization. in other words, it starts towards the leaves of the graph,
                     // and ends closer to the root.
@@ -461,32 +475,15 @@ impl<'a> Migration<'a> {
                         }
                     }
                 }
-            }
-        }
-
-        // we still have some operators that there are conflicting sharding requirements on.
-        // let's resolve them randomly but deterministically for the time being:
-        for (ni, shardings) in arbitrary_sharding {
-            let sharding = shardings.into_iter().min().unwrap();
-            if let Some(sharding) = self.assigned_sharding.insert(ni, sharding) {
-                unreachable!(
-                    "thought we had to shard {:?}, but was already sharded by {:?}",
-                    ni, sharding
+                materializations.insert(
+                    ni,
+                    Materialization {
+                        plan: Some(MaterializationPlan::Partial { paths }),
+                        keys,
+                    },
                 );
             }
-
-            for child in self.graph.edges_directed(ni, petgraph::Direction::Outgoing) {
-                let (i, col) = sharding;
-                match *child.weight() {
-                    Sharding::By(ci, ccol) if ci == i && ccol == col => {}
-                    _ => {
-                        use petgraph::visit::EdgeRef;
-                        shuffles.push((ni, child.target()));
-                    }
-                }
-            }
         }
-        let shuffles = shuffles;
 
         // we still have some operators that we haven't decided on the sharding of. these are
         // likely operators like filters, projections, and the like, which don't care how they're
@@ -498,6 +495,7 @@ impl<'a> Migration<'a> {
             .cloned()
             .collect();
         while !unassigned.is_empty() {
+            let n = unassigned.len();
             unassigned.retain(|&ni| {
                 // let's, for the time being, simply assign the sharding of a random parent.
                 let psharding = self
@@ -513,10 +511,14 @@ impl<'a> Migration<'a> {
                     true
                 }
             });
+
+            assert_ne!(unassigned.len(), n, "made no progress on sharding");
         }
 
         // TODO: handle shuffles: maybe this is where we decide _not_ to shard?
         // NOTE: if we un-shard, we can also suddenly keep more than one key in one mat.
+
+        // TODO: domain assigment
     }
 }
 
