@@ -34,8 +34,15 @@ impl Tmp {
     fn mirror(&self) -> Self {
         self.clone()
     }
+    fn egress(&self, _shuffle_to: Sharding) -> Self {
+        self.clone()
+    }
     fn rewire(&mut self, _ancestor: NodeIndex, _to: NodeIndex) {}
     fn is_base(&self) -> bool {
+        false
+    }
+    fn good_new_domain_boundary_above(&self) -> bool {
+        // true for aggregations and readers
         false
     }
 }
@@ -50,6 +57,7 @@ pub struct State {
     sharding: HashMap<DomainIndex, Sharding>,
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
+    ndomains: usize,
 }
 
 impl State {
@@ -59,6 +67,7 @@ impl State {
             added: Default::default(),
             assigned_domain: self.assigned_domain.clone(),
             assigned_sharding: self.assigned_sharding.clone(),
+            ndomains: self.ndomains,
             state: self,
         }
     }
@@ -73,6 +82,7 @@ pub struct Migration<'a> {
     state: &'a mut State,
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
+    ndomains: usize,
 }
 
 impl<'a> Migration<'a> {
@@ -515,10 +525,100 @@ impl<'a> Migration<'a> {
             assert_ne!(unassigned.len(), n, "made no progress on sharding");
         }
 
-        // TODO: handle shuffles: maybe this is where we decide _not_ to shard?
+        // insert sharding egress nodes as appropriate at each shuffle.
+        //
+        // TODO: maybe this is where we decide _not_ to shard?
         // NOTE: if we un-shard, we can also suddenly keep more than one key in one mat.
+        // NOTE: in theory we could de-duplicate sharder nodes if there were multiple children
+        // that required the same sharding by placing an identity in the target sharding.
+        for (src, dst) in shuffles {
+            let ei = self.graph.find_edge(src, dst).unwrap();
+            let src_sharding = Sharding::from(self.assigned_sharding[&src]);
+            let dst_sharding = self.graph[ei];
+            assert_ne!(src_sharding, dst_sharding);
 
-        // TODO: domain assigment
+            // add the sharder egress node
+            let shuffle = self.graph[src].egress(dst_sharding);
+            let sni = self.graph.add_node(shuffle);
+            self.graph.remove_edge(ei);
+            self.graph.add_edge(src, sni, src_sharding);
+            self.graph.add_edge(sni, dst, dst_sharding);
+            self.added.insert(sni);
+        }
+
+        // assign domains to all new nodes.
+        //
+        // there are only a few _requirements_ for domain assignment:
+        //
+        //  - nodes that are sharded differently must be in different domains
+        //  - joins must have their inputs materialized in their own domain
+        //
+        // we can also observe that it is relatively cheap to add a domain boundary above
+        // readers and aggregations, so we'd like to do that too.
+        //
+        // the way we're going to go about this is to first give every new node its own new domain.
+        // then we're going to repeatedly iterate over the nodes and adopt the domain of one of
+        // their ancestors unless doing so would violate one of the rules above. we'll also favor
+        // adopting existing domains rather than creating new ones.
+        let mut next = self.ndomains;
+        for &ni in &self.added {
+            self.assigned_domain.insert(ni, next);
+            next += 1;
+        }
+        let mut modified = true;
+        while modified {
+            for &ni in &self.added {
+                for nbri in self.graph.neighbors_undirected(ni) {
+                    // check whether this is a viable domain for this node:
+                    // don't merge domains across shuffles
+                    if self.assigned_sharding.get(&ni) != self.assigned_sharding.get(&nbri) {
+                        continue;
+                    }
+                    // don't merge domains good domain boundaries
+                    if self.graph.find_edge(ni, nbri).is_some() {
+                        // neighbor is a child
+                        if self.graph[nbri].good_new_domain_boundary_above() {
+                            continue;
+                        }
+                    } else {
+                        // neighbor is a parent
+                        if self.graph[ni].good_new_domain_boundary_above() {
+                            continue;
+                        }
+                    }
+
+                    // this is a candidate!
+                    // prefer it to our current assignment if it is smaller than ours.
+                    // that will prefer existing domains over new ones, and will also minimize the
+                    // number of new domains.
+                    let ours = self.assigned_domain[&ni];
+                    let theirs = self.assigned_domain[&nbri];
+                    if theirs < ours {
+                        self.assigned_domain.insert(ni, theirs);
+                        modified = true;
+                    }
+                }
+            }
+        }
+        // let's avoid sparse domain assignments:
+        let mut consec = HashMap::new();
+        let mut next = self.ndomains;
+        for &ni in &self.added {
+            let d = self.assigned_domain[&ni];
+            if d >= self.ndomains {
+                consec.entry(d).or_insert_with(|| {
+                    next += 1;
+                    next - 1
+                });
+            }
+        }
+        for &ni in &self.added {
+            let d = self.assigned_domain[&ni];
+            if d >= self.ndomains {
+                self.assigned_domain.insert(ni, consec[&d]);
+            }
+        }
+        self.ndomains += next;
     }
 }
 
