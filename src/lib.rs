@@ -31,7 +31,7 @@ impl Tmp {
     fn source_of(&self, _col: usize) -> impl Iterator<Item = (NodeIndex, Option<usize>)> {
         Vec::new().into_iter()
     }
-    fn mirror(&self) -> Self {
+    fn mirror(&self, _is_ingress: bool) -> Self {
         self.clone()
     }
     fn egress(&self, _shuffle_to: Sharding) -> Self {
@@ -48,8 +48,14 @@ impl Tmp {
     fn is_sharder(&self) -> bool {
         false
     }
+    fn is_ingress(&self) -> bool {
+        false
+    }
     fn is_egress(&self) -> bool {
         false
+    }
+    fn is_meta(&self) -> bool {
+        self.is_sharder() || self.is_ingress() || self.is_egress()
     }
     fn is_mirror(&self) -> bool {
         false
@@ -266,7 +272,7 @@ impl<'a> Migration<'a> {
         for (ni, column, want) in resharded_copy {
             // create a materialized identity node of ni that is sharded by the lookup key (column)
             // TODO: make sure to also unmark existing node as changed if applicable
-            let mirror = self.graph[ni].mirror();
+            let mirror = self.graph[ni].mirror(false);
             let mni = self.graph.add_node(mirror);
             // NOTE: we don't need to remove from materializations[ni], b/c of retain above.
             materializations
@@ -636,7 +642,10 @@ impl<'a> Migration<'a> {
                 // added to existing domain, so no need for egress/ingress
                 continue;
             }
-            // TODO: skip over nodes that have been converted into ingress or egress nodes
+            if self.graph[ni].is_meta() {
+                // sharders, ingress, and egress nodes we never need to do any re-wiring on.
+                continue;
+            }
 
             for pi in self
                 .graph
@@ -721,6 +730,10 @@ impl<'a> Migration<'a> {
                             //
                             // first, remove our connection to our grandparent.
                             // TODO: in theory, ni could already be a state copy mirror...
+
+                            // TODO
+                            assert!(self.added.contains(&pi));
+
                             let ei = self.graph.find_edge(ppi, pi).unwrap();
                             self.graph.remove_edge(ei).unwrap();
 
@@ -746,7 +759,7 @@ impl<'a> Migration<'a> {
                                 // this is the _left_ diagram from above.
 
                                 // so, first we change "our" sharder to an ingress
-                                let ingress = self.graph[pi].mirror();
+                                let ingress = self.graph[pi].mirror(true);
                                 *self.graph.node_weight_mut(pi).unwrap() = ingress;
 
                                 // we make it a child of the "other" sharder.
@@ -754,6 +767,9 @@ impl<'a> Migration<'a> {
                                 let e = self.graph[self.graph.find_edge(pi, ni).unwrap()];
                                 self.graph.add_edge(ppci, pi, e);
                                 self.graph[pi].rewire(ppi, ppci);
+
+                                // TODO
+                                assert!(self.added.contains(&ppcci));
 
                                 // then, we move the other child to be under this ingress
                                 let ei = self.graph.find_edge(ppci, ppcci).unwrap();
@@ -769,7 +785,7 @@ impl<'a> Migration<'a> {
                     }
 
                     // we're the first receiver in this domain, so we'll need to add an ingress
-                    let ingress = self.graph[pi].mirror();
+                    let ingress = self.graph[pi].mirror(true);
                     let ii = if let Some(ni) = disconnected.pop() {
                         // reduce, re-use, recycle
                         *self.graph.node_weight_mut(ni).unwrap() = ingress;
@@ -808,7 +824,7 @@ impl<'a> Migration<'a> {
                         self.graph[ni].rewire(pi, pci);
                     } else {
                         // nope; no such luck. we need to make our own ingress.
-                        let ingress = self.graph[pi].mirror();
+                        let ingress = self.graph[pi].mirror(true);
                         let ii = if let Some(ni) = disconnected.pop() {
                             // reduce, re-use, recycle
                             *self.graph.node_weight_mut(ni).unwrap() = ingress;
@@ -834,7 +850,7 @@ impl<'a> Migration<'a> {
                             .map(Sharding::from)
                             .unwrap_or(Sharding::None),
                     );
-                    let ingress = self.graph[pi].mirror();
+                    let ingress = self.graph[pi].mirror(true);
 
                     // add them to the graph (re-use where possible)
                     let ei = if let Some(ni) = disconnected.pop() {
@@ -883,7 +899,70 @@ impl<'a> Migration<'a> {
         }
         self.ndomains += next;
 
-        // TODO: fix up replay paths now that we have sharder/egress/ingress nodes.
+        // fix up replay paths now that we have sharder/egress/ingress nodes.
+        for (&ni, m) in &mut materializations {
+            if let Some(MaterializationPlan::Partial { ref mut paths }) = m.plan {
+                for path in paths {
+                    // path is something like d -> c -> b -> a where a is fully materialized.
+                    // what may have happened is that one or more links in the chain have had an
+                    // ingress + egress/sharder node injected into them. we can detect this by
+                    // walking each path and checking that each link in the path still exists. if
+                    // one is missing (say, between a and b), we look for all nodes that match:
+                    //
+                    //     a -> x -> y -> b
+                    //
+                    // where x is an ingress node and y is an egress or sharder.
+                    //
+                    // TODO: how does this interact with node index re-use?
+                    let mut oi = ni;
+                    let mut npath = Vec::new();
+                    'segment: for (i, (ni, col)) in path.drain(..).enumerate() {
+                        if i == 0 {
+                            npath.push((ni, col));
+                            continue;
+                        }
+
+                        if self.graph.find_edge(oi, ni).is_some() {
+                            // all good, think link is still there
+                            npath.push((ni, col));
+                            oi = ni;
+                            continue;
+                        }
+
+                        // this link has been replaced -- find its replacement.
+                        for pi in self
+                            .graph
+                            .neighbors_directed(ni, petgraph::Direction::Incoming)
+                        {
+                            if !self.graph[pi].is_ingress() {
+                                continue;
+                            }
+
+                            for ppi in self
+                                .graph
+                                .neighbors_directed(pi, petgraph::Direction::Incoming)
+                            {
+                                if !self.graph[ppi].is_egress() && !self.graph[ppi].is_sharder() {
+                                    continue;
+                                }
+
+                                if self.graph.find_edge(oi, ppi).is_some() {
+                                    // this is the link!
+                                    // TODO: can there be more than one such candidate?
+                                    let ocol = npath.last().unwrap().1;
+                                    npath.push((pi, ocol));
+                                    npath.push((ppi, ocol));
+                                    npath.push((ni, col));
+                                    continue 'segment;
+                                }
+                            }
+                        }
+                        unreachable!("replay path was broken, and we couldn't fix it!");
+                    }
+                    *path = npath;
+                }
+            }
+        }
     }
 }
 
