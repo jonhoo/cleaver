@@ -45,6 +45,12 @@ impl Tmp {
         // true for aggregations and readers
         false
     }
+    fn is_sharder(&self) -> bool {
+        false
+    }
+    fn is_mirror(&self) -> bool {
+        false
+    }
 }
 
 type Node = Tmp;
@@ -618,7 +624,159 @@ impl<'a> Migration<'a> {
                 self.assigned_domain.insert(ni, consec[&d]);
             }
         }
+        // add ingress/egress nodes where necessary
+        let mut extra = Vec::new();
+        let mut disconnected = Vec::new();
+        'merge: for &ni in &self.added {
+            let d = self.assigned_domain[&ni];
+            if d < self.ndomains {
+                // added to existing domain, so no need for egress/ingress
+                continue;
+            }
+            for pi in self
+                .graph
+                .neighbors_directed(ni, petgraph::Direction::Incoming)
+            {
+                let pd = self.assigned_domain[&pi];
+                if d == pd {
+                    // parent is in same domain
+                    continue;
+                }
+
+                if self.assigned_sharding.get(&ni) != self.assigned_sharding.get(&pi) {
+                    // there's a shuffle above us, so there's a sharder egress there
+                    assert!(self.graph[pi].is_sharder());
+
+                    // if we originally had `a -> b` and `a -> c`, and b and c are in the same
+                    // domain and sharded differently from a, then they should share a sharder.
+                    let mut ppis = self
+                        .graph
+                        .neighbors_directed(pi, petgraph::Direction::Incoming);
+                    let ppi = ppis.next().expect("sharder had no parent");
+                    assert_eq!(ppis.count(), 0, "sharder had more than one parent");
+                    for ppci in self
+                        .graph
+                        .neighbors_directed(ppi, petgraph::Direction::Outgoing)
+                    {
+                        if !self.graph[ppci].is_sharder() || ppci == pi {
+                            // not a sharder we might merge with pi
+                            continue;
+                        }
+
+                        // this is a sharder; check if it also goes to ni's domain
+                        // remember that a sharder can only ever have _one_ child
+                        let mut ppccis = self
+                            .graph
+                            .neighbors_directed(ppci, petgraph::Direction::Outgoing);
+                        let ppcci = ppccis.next().expect("sharder had no children");
+                        assert_eq!(ppccis.count(), 0, "sharder had more than one child");
+                        if self.assigned_domain[&ppcci] == d {
+                            // that sharder _does_ also lead to this domain!
+                            // let's merge them by having a single ingress in this domain.
+                            // so, we have this:
+                            //
+                            //              [ ppi ]
+                            //                 |
+                            //           +-----+------+
+                            //           v            v
+                            //         { pi }      { ppci }
+                            //           v            v
+                            //         [ ni ]     [ ppcci ]
+                            //
+                            // where pi and ppci are both {sharders}. we want to end up with:
+                            //
+                            //              [ ppi ]
+                            //                 v
+                            //               { ? }
+                            //                 v
+                            //               ( ? )
+                            //                 |
+                            //           +-----+------+
+                            //           v            v
+                            //         [ ni ]       [ ? ]
+                            //
+                            // where ( ? ) is an ingress node (a mirror of ppi). we don't really
+                            // care which of { pi } and { ppci } to use as the final sharded. We do
+                            // have an interesting case when ppcci is already an ingress node
+                            // though, since it may already have other merged children, and we may
+                            // as well re-use that ingress.
+                            //
+                            // so, we want to end up with one of these two rewirings:
+                            //
+                            //          [ ppi ]                     [ ppi ]
+                            //             |                           |
+                            //             +------+                    +------+
+                            //                    v                           v
+                            //     ( pi ) <--- { ppci }        { pi }      { ppci }
+                            //       |                                        |
+                            //       +------------+                           |
+                            //       |            |                           |
+                            //       v            v                           v
+                            //     [ ni ]     [ ppcci ]        [ ni ] <-- ( ppcci )
+                            //
+                            // first, remove our connection to our grandparent.
+                            // TODO: in theory, ni could already be a state copy mirror...
+                            let ei = self.graph.find_edge(ppi, pi).unwrap();
+                            let e = self.graph.remove_edge(ei).unwrap();
+                            // TODO: call node.rewire
+
+                            // next, figure out what we have to do to get the ingress in place.
+                            if self.graph[ppcci].is_mirror() {
+                                // we already have an ingress. let's just re-use it!
+                                // this is just a matter of replacing (pi, ni) with (ppcci, ni).
+                                //
+                                // this is the _right_ diagram from above.
+                                let ei = self.graph.find_edge(pi, ni).unwrap();
+                                let e = self.graph.remove_edge(ei).unwrap();
+                                self.graph.add_edge(ppci, ni, e);
+                                // TODO: call node.rewire
+
+                                // stash away pi in case we need some new nodes later
+                                disconnected.push(pi);
+                            } else {
+                                // we have to make an ingress node to merge these. specifically, we
+                                // turn _our_ sharder into an ingress, and keep the _other_ sharder
+                                // as a sharder, and then just do re-wiring. we do this to avoid
+                                // removing nodes (which would lead to unstable node indices).
+                                //
+                                // this is the _left_ diagram from above.
+
+                                // so, first we change "our" sharder to an ingress
+                                let ingress = self.graph[pi].mirror();
+                                *self.graph.node_weight_mut(pi).unwrap() = ingress;
+
+                                // we make it a child of the "other" sharder.
+                                // sharding is the same as the connection from sharder to ni.
+                                let e = self.graph[self.graph.find_edge(pi, ni).unwrap()];
+                                self.graph.add_edge(ppci, pi, e);
+                                // TODO: call node.rewire
+
+                                // then, we move the other child to be under this ingress
+                                let ei = self.graph.find_edge(ppci, ppcci).unwrap();
+                                let e = self.graph.remove_edge(ei).unwrap();
+                                self.graph.add_edge(pi, ppcci, e);
+                                // TODO: call node.rewire
+                            }
+
+                            // it's okay to break here since we can never merge with _more_ than
+                            // one sharder (one of them should already have merged with the other).
+                            continue 'merge;
+                        }
+                    }
+                }
+
+                // we're sharded the same as this ancestor, but are in a different domain.
+                // egress/ingress time!
+                // TODO
+            }
+        }
+        self.added.extend(extra);
+        if !disconnected.is_empty() {
+            unimplemented!("gc disconnected nodes");
+        }
         self.ndomains += next;
+
+        // TODO: fix up replay paths now that we have sharder/egress/ingress nodes.
     }
 }
 
