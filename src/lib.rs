@@ -48,6 +48,9 @@ impl Tmp {
     fn is_sharder(&self) -> bool {
         false
     }
+    fn is_egress(&self) -> bool {
+        false
+    }
     fn is_mirror(&self) -> bool {
         false
     }
@@ -717,7 +720,7 @@ impl<'a> Migration<'a> {
                             // first, remove our connection to our grandparent.
                             // TODO: in theory, ni could already be a state copy mirror...
                             let ei = self.graph.find_edge(ppi, pi).unwrap();
-                            let e = self.graph.remove_edge(ei).unwrap();
+                            self.graph.remove_edge(ei).unwrap();
                             // TODO: call node.rewire
 
                             // next, figure out what we have to do to get the ingress in place.
@@ -763,11 +766,96 @@ impl<'a> Migration<'a> {
                             continue 'merge;
                         }
                     }
+
+                    // we're the first receiver in this domain, so we'll need to add an ingress
+                    // TODO
+                    continue 'merge;
                 }
 
                 // we're sharded the same as this ancestor, but are in a different domain.
                 // egress/ingress time!
-                // TODO
+                if self.graph[pi].is_egress() {
+                    // it's already an egress node! let's check if there's an exisitng ingress node
+                    // we can re-use.
+                    let pci = self
+                        .graph
+                        .neighbors_directed(pi, petgraph::Direction::Outgoing)
+                        .find(|pci| self.assigned_domain[pci] == d);
+                    if let Some(pci) = pci {
+                        // yes there is!
+                        // just wire us in under that ingress.
+                        let ei = self.graph.find_edge(pi, ni).unwrap();
+                        let e = self.graph.remove_edge(ei).unwrap();
+                        self.graph.add_edge(pci, ni, e);
+                    // TODO: call node.rewire
+                    } else {
+                        // nope; no such luck. we need to make our own ingress.
+                        let ingress = self.graph[pi].mirror();
+                        let ii = if let Some(ni) = disconnected.pop() {
+                            // reduce, re-use, recycle
+                            *self.graph.node_weight_mut(ni).unwrap() = ingress;
+                            ni
+                        } else {
+                            let ni = self.graph.add_node(ingress);
+                            extra.push(ni);
+                            ni
+                        };
+                        // and then wire ourselves in under that ingress
+                        let ei = self.graph.find_edge(pi, ni).unwrap();
+                        let e = self.graph.remove_edge(ei).unwrap();
+                        self.graph.add_edge(pi, ii, e);
+                        self.graph.add_edge(ii, ni, e);
+                        // TODO: call node.rewire
+                    }
+                } else {
+                    // we'll have to create both an egress and an ingress node.
+                    let egress = self.graph[pi].egress(
+                        self.assigned_sharding
+                            .get(&ni)
+                            .cloned()
+                            .map(Sharding::from)
+                            .unwrap_or(Sharding::None),
+                    );
+                    let ingress = self.graph[pi].mirror();
+
+                    // add them to the graph (re-use where possible)
+                    let ei = if let Some(ni) = disconnected.pop() {
+                        // reduce, re-use, recycle
+                        *self.graph.node_weight_mut(ni).unwrap() = egress;
+                        ni
+                    } else {
+                        let ni = self.graph.add_node(egress);
+                        extra.push(ni);
+                        ni
+                    };
+                    let ii = if let Some(ni) = disconnected.pop() {
+                        // reduce, re-use, recycle
+                        *self.graph.node_weight_mut(ni).unwrap() = ingress;
+                        ni
+                    } else {
+                        let ni = self.graph.add_node(ingress);
+                        extra.push(ni);
+                        ni
+                    };
+
+                    // and then wire in that pair above us
+                    let edge = self.graph.find_edge(pi, ni).unwrap();
+                    let e = self.graph.remove_edge(edge).unwrap();
+                    self.graph.add_edge(
+                        pi,
+                        ei,
+                        self.assigned_sharding
+                            .get(&pi)
+                            .cloned()
+                            .map(Sharding::from)
+                            .unwrap_or(Sharding::None),
+                    );
+                    self.graph.add_edge(ei, ii, e);
+                    self.graph.add_edge(ii, ni, e);
+                }
+
+                // XXX: is there really no reason to look at other parents?
+                continue 'merge;
             }
         }
         self.added.extend(extra);
