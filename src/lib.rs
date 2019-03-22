@@ -923,6 +923,9 @@ impl MaterializationPlan {
     }
 }
 
+// TODO: add unit tests for planning and materializations!
+// that will help _immensely_ when we want to make changes later!
+
 #[cfg(test)]
 mod test {
     use super::*;
