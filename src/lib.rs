@@ -636,6 +636,8 @@ impl<'a> Migration<'a> {
                 // added to existing domain, so no need for egress/ingress
                 continue;
             }
+            // TODO: skip over nodes that have been converted into ingress or egress nodes
+
             for pi in self
                 .graph
                 .neighbors_directed(ni, petgraph::Direction::Incoming)
@@ -721,7 +723,6 @@ impl<'a> Migration<'a> {
                             // TODO: in theory, ni could already be a state copy mirror...
                             let ei = self.graph.find_edge(ppi, pi).unwrap();
                             self.graph.remove_edge(ei).unwrap();
-                            // TODO: call node.rewire
 
                             // next, figure out what we have to do to get the ingress in place.
                             if self.graph[ppcci].is_mirror() {
@@ -732,7 +733,7 @@ impl<'a> Migration<'a> {
                                 let ei = self.graph.find_edge(pi, ni).unwrap();
                                 let e = self.graph.remove_edge(ei).unwrap();
                                 self.graph.add_edge(ppci, ni, e);
-                                // TODO: call node.rewire
+                                self.graph[ni].rewire(pi, ppci);
 
                                 // stash away pi in case we need some new nodes later
                                 disconnected.push(pi);
@@ -752,13 +753,13 @@ impl<'a> Migration<'a> {
                                 // sharding is the same as the connection from sharder to ni.
                                 let e = self.graph[self.graph.find_edge(pi, ni).unwrap()];
                                 self.graph.add_edge(ppci, pi, e);
-                                // TODO: call node.rewire
+                                self.graph[pi].rewire(ppi, ppci);
 
                                 // then, we move the other child to be under this ingress
                                 let ei = self.graph.find_edge(ppci, ppcci).unwrap();
                                 let e = self.graph.remove_edge(ei).unwrap();
                                 self.graph.add_edge(pi, ppcci, e);
-                                // TODO: call node.rewire
+                                self.graph[ppcci].rewire(ppci, pi);
                             }
 
                             // it's okay to break here since we can never merge with _more_ than
@@ -768,7 +769,24 @@ impl<'a> Migration<'a> {
                     }
 
                     // we're the first receiver in this domain, so we'll need to add an ingress
-                    // TODO
+                    let ingress = self.graph[pi].mirror();
+                    let ii = if let Some(ni) = disconnected.pop() {
+                        // reduce, re-use, recycle
+                        *self.graph.node_weight_mut(ni).unwrap() = ingress;
+                        ni
+                    } else {
+                        let ni = self.graph.add_node(ingress);
+                        extra.push(ni);
+                        ni
+                    };
+                    // and then wire ourselves in under that ingress
+                    let ei = self.graph.find_edge(pi, ni).unwrap();
+                    let e = self.graph.remove_edge(ei).unwrap();
+                    self.graph.add_edge(pi, ii, e);
+                    self.graph.add_edge(ii, ni, e);
+                    self.graph[ni].rewire(pi, ii);
+
+                    // XXX: is there really no reason to look at other parents?
                     continue 'merge;
                 }
 
@@ -787,7 +805,7 @@ impl<'a> Migration<'a> {
                         let ei = self.graph.find_edge(pi, ni).unwrap();
                         let e = self.graph.remove_edge(ei).unwrap();
                         self.graph.add_edge(pci, ni, e);
-                    // TODO: call node.rewire
+                        self.graph[ni].rewire(pi, pci);
                     } else {
                         // nope; no such luck. we need to make our own ingress.
                         let ingress = self.graph[pi].mirror();
@@ -805,7 +823,7 @@ impl<'a> Migration<'a> {
                         let e = self.graph.remove_edge(ei).unwrap();
                         self.graph.add_edge(pi, ii, e);
                         self.graph.add_edge(ii, ni, e);
-                        // TODO: call node.rewire
+                        self.graph[ni].rewire(pi, ii);
                     }
                 } else {
                     // we'll have to create both an egress and an ingress node.
@@ -852,6 +870,7 @@ impl<'a> Migration<'a> {
                     );
                     self.graph.add_edge(ei, ii, e);
                     self.graph.add_edge(ii, ni, e);
+                    self.graph[ni].rewire(pi, ii);
                 }
 
                 // XXX: is there really no reason to look at other parents?
