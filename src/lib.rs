@@ -973,6 +973,7 @@ impl Stage {
         // TODO: do we need to check for "partially overlapping partial indices"?
         // TODO: replays across aliased join columns (mat/mod.rs:541)
         // TODO: prioritize known-empty views when doing replays across joins?
+        // TODO: compute replay path for full materializations
 
         // we now have to construct a plan for getting from the original Dataflow to the Dataflow
         // we just designed. while we _could_ keep track of the changes we make as we make them
@@ -987,12 +988,10 @@ impl Stage {
         //    3.1. also inform downstream ingress nodes about added columns
         //  4. for each new ingress, find parent egress/sharder, and tell it about new tx
         //    NOTE: egress nodes should only be told about corresponding shard!
-        //  5. add all materializations to existing nodes
-        //  6. add all materializations to new nodes
-        //  7. set up all replay paths
-        //  8. perform all full replays in topological order
-        //    NOTE: i'm not actually sure whether 5678 can happen individually in that order.
-        //          it may very well be that we have to do the replays one by one like we do now.
+        //  5. for each new materialization (could be on existing node), in topo order:
+        //    5.1. send "preparestate"
+        //    5.2. set up replay path(s)
+        //    5.3. (if full) initiate and wait for replay.
 
         Dataflow {
             graph: self.graph,
