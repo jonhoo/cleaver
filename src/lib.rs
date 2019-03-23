@@ -66,41 +66,37 @@ type Node = Tmp;
 type Edge = Sharding;
 
 #[derive(Default, Debug)]
-pub struct State {
+pub struct Dataflow {
     graph: petgraph::Graph<Node, Edge>,
-    in_domain: HashMap<NodeIndex, DomainIndex>,
-    sharding: HashMap<DomainIndex, Sharding>,
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
     ndomains: usize,
 }
 
-impl State {
-    pub fn migrate(&mut self) -> Migration {
-        Migration {
+impl Dataflow {
+    pub fn stage(&self) -> Stage {
+        Stage {
             graph: self.graph.clone(),
             added: Default::default(),
             assigned_domain: self.assigned_domain.clone(),
             assigned_sharding: self.assigned_sharding.clone(),
             ndomains: self.ndomains,
-            state: self,
         }
     }
 }
 
-pub struct Migration<'a> {
+pub struct Stage {
     graph: petgraph::Graph<Node, Edge>,
 
     // we want to preserve add order so that we can cheaply iterate in topological order
     added: HashSet<NodeIndex>,
 
-    state: &'a mut State,
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
     ndomains: usize,
 }
 
-impl<'a> Migration<'a> {
+impl Stage {
     fn resolve_for_lookup(&self, mut ni: NodeIndex, mut column: usize) -> (NodeIndex, usize) {
         loop {
             // canonicalize by always choosing smaller node index
@@ -121,7 +117,8 @@ impl<'a> Migration<'a> {
         }
     }
 
-    pub fn commit(mut self) {
+    #[must_use]
+    pub fn plan(mut self) -> Dataflow {
         // first, find all _required_ shardings
         let mut desired_sharding = HashMap::new();
         for &ni in &self.added {
@@ -962,6 +959,46 @@ impl<'a> Migration<'a> {
                     *path = npath;
                 }
             }
+        }
+
+        // TODO: multi-column keys
+        //  + force unsharded
+        // TODO: base column change
+        // TODO: query-through
+        // TODO: node does lookups in ancestor *and* self on non-consistent key
+        //  + force unsharded
+        // TODO: i'm pretty sure that _somewhere_ we'll have to detect that the two input shardings
+        // of a join are "equivalent".
+        // TODO: insert shard mergers _for the time being_?
+        // TODO: do we need to check for "partially overlapping partial indices"?
+        // TODO: replays across aliased join columns (mat/mod.rs:541)
+        // TODO: prioritize known-empty views when doing replays across joins?
+
+        // we now have to construct a plan for getting from the original Dataflow to the Dataflow
+        // we just designed. while we _could_ keep track of the changes we make as we make them
+        // above, that'd make the above code much trickier to read. instead, we'll just construct
+        // the delta here, even if that is a bit more costly.
+        //
+        // the ultimate plan has several stages:
+        //
+        //  1. boot all new domains with their nodes
+        //  2. for each new _node_ send that node to its domain (inc. anc. information)
+        //  3. tell all old base nodes about column changes
+        //    3.1. also inform downstream ingress nodes about added columns
+        //  4. for each new ingress, find parent egress/sharder, and tell it about new tx
+        //    NOTE: egress nodes should only be told about corresponding shard!
+        //  5. add all materializations to existing nodes
+        //  6. add all materializations to new nodes
+        //  7. set up all replay paths
+        //  8. perform all full replays in topological order
+        //    NOTE: i'm not actually sure whether 5678 can happen individually in that order.
+        //          it may very well be that we have to do the replays one by one like we do now.
+
+        Dataflow {
+            graph: self.graph,
+            assigned_domain: self.assigned_domain,
+            assigned_sharding: self.assigned_sharding,
+            ndomains: self.ndomains,
         }
     }
 }
