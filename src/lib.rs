@@ -87,6 +87,7 @@ pub struct Stage<O> {
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
     ndomains: usize,
+    new_domains: usize,
 }
 
 impl<O: DataflowOperator> Stage<O> {
@@ -112,7 +113,7 @@ impl<O: DataflowOperator> Stage<O> {
     }
 
     #[must_use]
-    pub fn plan(mut self) -> Vec<plan::Step<O>> {
+    pub fn plan(mut self) -> (Dataflow, Vec<plan::Step>) {
         // first, find all _required_ shardings
         let mut desired_sharding = HashMap::new();
         for &ni in &self.added {
@@ -885,6 +886,7 @@ impl<O: DataflowOperator> Stage<O> {
         if !disconnected.is_empty() {
             unimplemented!("gc disconnected nodes");
         }
+        self.new_domains = next;
         self.ndomains += next;
 
         // fix up replay paths now that we have sharder/egress/ingress nodes.
@@ -966,7 +968,16 @@ impl<O: DataflowOperator> Stage<O> {
         // TODO: prioritize known-empty views when doing replays across joins?
         // TODO: compute replay path for full materializations
 
-        plan::from_staged(self)
+        let plan = plan::from_staged(&self);
+        let df = Dataflow {
+            graph: self.graph,
+            materializations: self.materializations,
+            assigned_domain: self.assigned_domain,
+            assigned_sharding: self.assigned_sharding,
+            ndomains: self.ndomains,
+        };
+
+        (df, plan)
     }
 }
 

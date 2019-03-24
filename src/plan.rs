@@ -1,4 +1,5 @@
 use petgraph::graph::NodeIndex;
+use std::collections::HashMap;
 
 pub struct Modification;
 pub enum Connect {
@@ -8,14 +9,14 @@ pub enum Connect {
 pub struct StateDescription;
 pub struct Tag;
 
-pub enum Step<O> {
+pub enum Step {
     Boot {
         index: super::DomainIndex,
-        nodes: Vec<O>,
+        nodes: Vec<NodeIndex>,
     },
     Append {
         domain: super::DomainIndex,
-        node: O,
+        node: NodeIndex,
     },
     Modify {
         domain: super::DomainIndex,
@@ -43,7 +44,7 @@ pub enum Step<O> {
     },
 }
 
-pub(crate) fn from_staged<O>(staged: super::Stage<O>) -> Vec<Step<O>> {
+pub(crate) fn from_staged<O: super::DataflowOperator>(staged: &super::Stage<O>) -> Vec<Step> {
     // we now have to construct a plan for getting from the original Dataflow to the Dataflow
     // we just designed. while we _could_ keep track of the changes we make as we make them
     // above, that'd make the above code much trickier to read. instead, we'll just construct
@@ -61,5 +62,73 @@ pub(crate) fn from_staged<O>(staged: super::Stage<O>) -> Vec<Step<O>> {
     //    5.1. send "preparestate"
     //    5.2. set up replay path(s)
     //    5.3. (if full) initiate and wait for replay.
-    unimplemented!()
+    let mut steps = Vec::new();
+
+    // Step 1: boot new domains
+    let mut new_domains = HashMap::new();
+    for &ni in &staged.added {
+        if staged.assigned_domain[&ni] < staged.ndomains - staged.new_domains {
+            continue;
+        }
+
+        // TODO: assign local index
+        new_domains
+            .entry(staged.assigned_domain[&ni])
+            .or_insert_with(Vec::new)
+            .push(ni);
+    }
+    for (di, nodes) in new_domains {
+        // TODO: nodes should be in topo order
+        steps.push(Step::Boot { index: di, nodes });
+    }
+
+    // Step 2: augment existing domains
+    // TODO: topological order
+    let mut changed_domains = HashMap::new();
+    for &ni in &staged.added {
+        let di = staged.assigned_domain[&ni];
+        if di >= staged.ndomains - staged.new_domains {
+            continue;
+        }
+
+        // TODO: assign local index
+        steps.push(Step::Append {
+            domain: di,
+            node: ni,
+        });
+    }
+
+    // Step 3: base table column changes
+    // TODO
+
+    // Step 4: connect egress/sharder to ingress nodes
+    for &ni in &staged.added {
+        if !staged.graph[ni].is_ingress() {
+            continue;
+        }
+
+        for pi in staged
+            .graph
+            .neighbors_directed(ni, petgraph::Direction::Incoming)
+        {
+            if staged.graph[pi].is_egress() {
+                steps.push(Step::Connect {
+                    domain: staged.assigned_domain[&pi],
+                    node: ni,
+                    c: Connect::Egress,
+                });
+            } else if staged.graph[pi].is_sharder() {
+                steps.push(Step::Connect {
+                    domain: staged.assigned_domain[&pi],
+                    node: ni,
+                    c: Connect::Sharder,
+                });
+            }
+        }
+    }
+
+    // Step 5: set up all materializations
+    // TODO
+
+    steps
 }
