@@ -1,10 +1,12 @@
 use petgraph::graph::NodeIndex;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
+mod plan;
+
 type DomainIndex = usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-enum Sharding {
+pub enum Sharding {
     None,
     By(NodeIndex, usize),
 }
@@ -21,23 +23,13 @@ impl From<(NodeIndex, usize)> for Sharding {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct Tmp;
+pub trait DataflowOperator {
+    fn lookup_in(&self) -> Vec<(NodeIndex, usize)>;
+    fn source_of(&self, _col: usize) -> Vec<(NodeIndex, Option<usize>)>;
+    fn mirror(&self, _is_ingress: bool) -> Self;
+    fn egress(&self, _shuffle_to: Sharding) -> Self;
+    fn rewire(&mut self, ancestor: NodeIndex, to: NodeIndex);
 
-impl Tmp {
-    fn lookup_in(&self) -> impl Iterator<Item = (NodeIndex, usize)> {
-        Vec::new().into_iter()
-    }
-    fn source_of(&self, _col: usize) -> impl Iterator<Item = (NodeIndex, Option<usize>)> {
-        Vec::new().into_iter()
-    }
-    fn mirror(&self, _is_ingress: bool) -> Self {
-        self.clone()
-    }
-    fn egress(&self, _shuffle_to: Sharding) -> Self {
-        self.clone()
-    }
-    fn rewire(&mut self, _ancestor: NodeIndex, _to: NodeIndex) {}
     fn is_base(&self) -> bool {
         false
     }
@@ -62,22 +54,24 @@ impl Tmp {
     }
 }
 
-type Node = Tmp;
 type Edge = Sharding;
 
 #[derive(Default, Debug)]
-pub struct Dataflow {
-    graph: petgraph::Graph<Node, Edge>,
+pub struct Dataflow<O> {
+    graph: petgraph::Graph<O, Edge>,
+    materializations: HashMap<NodeIndex, Materialization>,
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
     ndomains: usize,
 }
 
-impl Dataflow {
-    pub fn stage(&self) -> Stage {
+impl<O: Clone> Dataflow<O> {
+    pub fn stage(&self) -> Stage<O> {
         Stage {
             graph: self.graph.clone(),
             added: Default::default(),
+            touched: Default::default(),
+            materializations: self.materializations.clone(),
             assigned_domain: self.assigned_domain.clone(),
             assigned_sharding: self.assigned_sharding.clone(),
             ndomains: self.ndomains,
@@ -85,23 +79,23 @@ impl Dataflow {
     }
 }
 
-pub struct Stage {
-    graph: petgraph::Graph<Node, Edge>,
-
-    // we want to preserve add order so that we can cheaply iterate in topological order
+pub struct Stage<O> {
+    graph: petgraph::Graph<O, Edge>,
     added: HashSet<NodeIndex>,
-
+    touched: HashSet<NodeIndex>,
+    materializations: HashMap<NodeIndex, Materialization>,
     assigned_domain: HashMap<NodeIndex, DomainIndex>,
     assigned_sharding: HashMap<NodeIndex, (NodeIndex, usize)>,
     ndomains: usize,
 }
 
-impl Stage {
+impl<O: DataflowOperator> Stage<O> {
     fn resolve_for_lookup(&self, mut ni: NodeIndex, mut column: usize) -> (NodeIndex, usize) {
         loop {
             // canonicalize by always choosing smaller node index
             match self.graph[ni]
                 .source_of(column)
+                .into_iter()
                 .filter_map(|(pi, col)| col.map(move |col| (pi, col)))
                 .min_by_key(|(pi, _)| *pi)
             {
@@ -118,7 +112,7 @@ impl Stage {
     }
 
     #[must_use]
-    pub fn plan(mut self) -> Dataflow {
+    pub fn plan(mut self) -> Vec<plan::Step<O>> {
         // first, find all _required_ shardings
         let mut desired_sharding = HashMap::new();
         for &ni in &self.added {
@@ -126,7 +120,11 @@ impl Stage {
             // state. note that we go towards the min same as with resolve. this is so that an
             // operator that does lookups into the output of a join by the join key is considered
             // sharded the same way as the join itself.
-            if let Some((neighbor, column)) = self.graph[ni].lookup_in().min_by_key(|(i, _)| *i) {
+            if let Some((neighbor, column)) = self.graph[ni]
+                .lookup_in()
+                .into_iter()
+                .min_by_key(|(i, _)| *i)
+            {
                 self.assigned_sharding
                     .insert(ni, self.resolve_for_lookup(neighbor, column));
             }
@@ -212,44 +210,38 @@ impl Stage {
         // first of all, we need to determine all the things that are going to be materialized,
         // and what they'll be keyed with. note that this may introduce materializations on
         // _existing_ nodes in the data-flow!
-        let mut materializations = HashMap::new();
+        let mut resharded_copy = Vec::new();
         for &ni in &self.added {
             // if a node does lookups into a particular state, there must be a materialization on
             // that state (TODO: relax this for query_through).
             for (neighbor, column) in self.graph[ni].lookup_in() {
-                if !self.added.contains(&neighbor) {
-                    // TODO: keep track of the fact that we need to add the appropriate index
+                // we may end up with nodes that are sharded, but also have multiple keys into
+                // their materializations. this won't work -- we will have to keep a second,
+                // re-sharded copy of the materialization for each other sharding.
+                if let Some(sharding) = self.assigned_sharding.get(&neighbor) {
+                    let want = self.resolve_for_lookup(neighbor, column);
+                    if *sharding != want {
+                        // we'll need re-sharded copy of this state
+                        resharded_copy.push((neighbor, column, want));
+                        continue;
+                    }
                 }
 
-                materializations
+                if !self.added.contains(&neighbor) {
+                    // this adds an index on an existing node (which may not even be materialized)
+                    // TODO: are there cases where this is illegal?
+                    self.touched.insert(neighbor);
+                }
+
+                // should be all good to add the given index
+                self.materializations
                     .entry(neighbor)
                     .or_insert_with(Materialization::default)
                     .keys
                     .insert(column);
             }
         }
-
-        // we may end up with nodes that are sharded, but also have multiple keys into their
-        // materializations. this won't work -- we will have to keep a second, re-sharded copy of
-        // the materialization for each other sharding.
-        let mut resharded_copy = Vec::new();
-        // TODO: only look at new?
-        for (&ni, mat) in &mut materializations {
-            if let Some(sharding) = self.assigned_sharding.get(&ni) {
-                // self is sharded -- check for any incompatible indices
-                mat.keys.retain(|&column| {
-                    let want = self.resolve_for_lookup(ni, column);
-                    if *sharding != want {
-                        // we'll need re-sharded copy of this state
-                        resharded_copy.push((ni, column, want));
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-        }
-        // it's time to insert the identity nodes.
+        // it's time to insert the re-sharded state copy nodes, which are just identity nodes.
         // one thing to keep in mind though is that we'll want to do topological iterations over
         // the new nodes further down. normally, we could just iterate over the new nodes in order
         // of their node id (since a child must be added after its parent, and would thus get a
@@ -268,11 +260,10 @@ impl Stage {
         }
         for (ni, column, want) in resharded_copy {
             // create a materialized identity node of ni that is sharded by the lookup key (column)
-            // TODO: make sure to also unmark existing node as changed if applicable
+            // TODO: check if there is already a re-sharded copy we can re-use
             let mirror = self.graph[ni].mirror(false);
             let mni = self.graph.add_node(mirror);
-            // NOTE: we don't need to remove from materializations[ni], b/c of retain above.
-            materializations
+            self.materializations
                 .entry(mni)
                 .or_insert_with(Materialization::default)
                 .keys
@@ -323,12 +314,12 @@ impl Stage {
             index: ni,
         }) = topo.pop()
         {
-            if let Some(mut materialization) = materializations.remove(&ni) {
+            if let Some(mut materialization) = self.materializations.remove(&ni) {
                 if let Some(ref plan) = materialization.plan {
                     // materialization state has already been determined!
                     // that can only be the case if we have already determined it needs to be full.
                     assert!(plan.is_full());
-                    materializations.insert(ni, materialization);
+                    self.materializations.insert(ni, materialization);
                     continue;
                 }
 
@@ -353,7 +344,7 @@ impl Stage {
                         // we want to extend the path to get to a full materialization, which we do
                         // by continuously resolving the last (node, column) pair we got to.
                         let (lni, lcol) = path.last().cloned().unwrap();
-                        if let Some(mat) = materializations.get(&lni) {
+                        if let Some(mat) = self.materializations.get(&lni) {
                             if let Some(true) = mat.is_full() {
                                 // this path is already complete
                                 // TODO: how do we detect termination?
@@ -405,7 +396,7 @@ impl Stage {
                         // mark as full, and mark all ancestor materializations as full
                         let mut visit = vec![ni];
                         while let Some(ni) = visit.pop() {
-                            if let Some(mat) = materializations.get_mut(&ni) {
+                            if let Some(mat) = self.materializations.get_mut(&ni) {
                                 if !self.added.contains(&ni)
                                     && !mat
                                         .is_full()
@@ -450,7 +441,7 @@ impl Stage {
                         // TODO: when we announce this plan, we have to announce it in segments!
                     }
                 }
-                materializations.insert(ni, materialization);
+                self.materializations.insert(ni, materialization);
             }
         }
 
@@ -463,7 +454,7 @@ impl Stage {
             if let Some(Materialization {
                 plan: Some(MaterializationPlan::Partial { mut paths }),
                 keys,
-            }) = materializations.remove(&ni)
+            }) = self.materializations.remove(&ni)
             {
                 for path in &mut paths {
                     // each path _starts_ with the materialization at ni, and ends in _some_ full
@@ -477,7 +468,7 @@ impl Stage {
                             if let Some(Materialization {
                                 plan: Some(MaterializationPlan::Full),
                                 ..
-                            }) = materializations.get(&ni)
+                            }) = self.materializations.get(&ni)
                             {
                                 true
                             } else {
@@ -489,7 +480,7 @@ impl Stage {
 
                     // next, we have to add any indices mandated by the new replay path
                     for &mut (ni, col) in path {
-                        if let Some(mat) = materializations.get_mut(&ni) {
+                        if let Some(mat) = self.materializations.get_mut(&ni) {
                             if mat.keys.insert(col) && self.assigned_sharding.contains_key(&ni) {
                                 // I _think_ this is the join eviction case?
                                 // TODO
@@ -497,7 +488,7 @@ impl Stage {
                         }
                     }
                 }
-                materializations.insert(
+                self.materializations.insert(
                     ni,
                     Materialization {
                         plan: Some(MaterializationPlan::Partial { paths }),
@@ -897,7 +888,7 @@ impl Stage {
         self.ndomains += next;
 
         // fix up replay paths now that we have sharder/egress/ingress nodes.
-        for (&ni, m) in &mut materializations {
+        for (&ni, m) in &mut self.materializations {
             if let Some(MaterializationPlan::Partial { ref mut paths }) = m.plan {
                 for path in paths {
                     // path is something like d -> c -> b -> a where a is fully materialized.
@@ -975,30 +966,7 @@ impl Stage {
         // TODO: prioritize known-empty views when doing replays across joins?
         // TODO: compute replay path for full materializations
 
-        // we now have to construct a plan for getting from the original Dataflow to the Dataflow
-        // we just designed. while we _could_ keep track of the changes we make as we make them
-        // above, that'd make the above code much trickier to read. instead, we'll just construct
-        // the delta here, even if that is a bit more costly.
-        //
-        // the ultimate plan has several stages:
-        //
-        //  1. boot all new domains with their nodes
-        //  2. for each new _node_ send that node to its domain (inc. anc. information)
-        //  3. tell all old base nodes about column changes
-        //    3.1. also inform downstream ingress nodes about added columns
-        //  4. for each new ingress, find parent egress/sharder, and tell it about new tx
-        //    NOTE: egress nodes should only be told about corresponding shard!
-        //  5. for each new materialization (could be on existing node), in topo order:
-        //    5.1. send "preparestate"
-        //    5.2. set up replay path(s)
-        //    5.3. (if full) initiate and wait for replay.
-
-        Dataflow {
-            graph: self.graph,
-            assigned_domain: self.assigned_domain,
-            assigned_sharding: self.assigned_sharding,
-            ndomains: self.ndomains,
-        }
+        plan::from_staged(self)
     }
 }
 
