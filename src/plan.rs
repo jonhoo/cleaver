@@ -7,6 +7,7 @@ pub enum Connect {
     Sharder,
 }
 pub struct StateDescription;
+#[derive(Clone, Copy)]
 pub struct Tag;
 
 pub enum Step {
@@ -36,7 +37,7 @@ pub enum Step {
     RegisterPath {
         tag: Tag,
         domain: super::DomainIndex,
-        path: Vec<Vec<(NodeIndex, usize)>>,
+        path: Vec<(NodeIndex, usize)>,
     },
     FullReplay {
         tag: Tag,
@@ -84,7 +85,6 @@ pub(crate) fn from_staged<O: super::DataflowOperator>(staged: &super::Stage<O>) 
 
     // Step 2: augment existing domains
     // TODO: topological order
-    let mut changed_domains = HashMap::new();
     for &ni in &staged.added {
         let di = staged.assigned_domain[&ni];
         if di >= staged.ndomains - staged.new_domains {
@@ -128,7 +128,63 @@ pub(crate) fn from_staged<O: super::DataflowOperator>(staged: &super::Stage<O>) 
     }
 
     // Step 5: set up all materializations
-    // TODO
+    // TODO: in topo order
+    for &ni in staged.added.union(&staged.touched) {
+        if let Some(m) = staged.materializations.get(&ni) {
+            let new = staged.added.contains(&ni);
+            if !new {
+                // TODO: how do we know whether a materialization was added, or just a key?
+            } else {
+                steps.push(Step::PrepareState {
+                    domain: staged.assigned_domain[&ni],
+                    node: ni,
+                    s: StateDescription,
+                });
+
+                match m
+                    .plan
+                    .as_ref()
+                    .expect("no materialization plan established")
+                {
+                    super::MaterializationPlan::Full => {
+                        // TODO: do replay
+                        // TODO: how do we know/inform about paths?
+                    }
+                    super::MaterializationPlan::Partial { ref paths } => {
+                        // every path here is an upquery path
+                        for path in paths {
+                            let tag = Tag; // TODO
+
+                            // we need to tell each domain on the path about its segment of the
+                            // upquery path.
+                            // TODO: should we just tell each domain about the full path?
+                            // TODO: does it also need to know about the node _after_
+                            //       egress/sharder so it doesn't send to all children?
+                            let mut segment = Vec::new();
+                            for (i, &(ni, col)) in path.iter().enumerate() {
+                                segment.push((ni, col));
+
+                                let d = staged.assigned_domain[&ni];
+                                if i == path.len() - 1
+                                    || d != staged.assigned_domain[&path[i + 1].0]
+                                {
+                                    // TODO: do we need to reverse the path here? probably.
+                                    steps.push(Step::RegisterPath {
+                                        tag,
+                                        domain: d,
+                                        path: segment.split_off(0),
+                                    });
+                                }
+                            }
+                            assert!(segment.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // TODO: mark as ready
 
     steps
 }

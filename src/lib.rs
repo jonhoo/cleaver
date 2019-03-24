@@ -74,6 +74,7 @@ impl<O: Clone> Dataflow<O> {
             materializations: self.materializations.clone(),
             assigned_domain: self.assigned_domain.clone(),
             assigned_sharding: self.assigned_sharding.clone(),
+            new_domains: 0,
             ndomains: self.ndomains,
         }
     }
@@ -113,7 +114,7 @@ impl<O: DataflowOperator> Stage<O> {
     }
 
     #[must_use]
-    pub fn plan(mut self) -> (Dataflow, Vec<plan::Step>) {
+    pub fn plan(mut self) -> (Dataflow<O>, Vec<plan::Step>) {
         // first, find all _required_ shardings
         let mut desired_sharding = HashMap::new();
         for &ni in &self.added {
