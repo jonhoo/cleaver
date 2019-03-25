@@ -43,6 +43,10 @@ pub enum Step {
         tag: Tag,
         domain: super::DomainIndex,
     },
+    Ready {
+        domain: super::DomainIndex,
+        node: NodeIndex,
+    },
 }
 
 pub(crate) fn from_staged<O: super::DataflowOperator>(staged: &super::Stage<O>) -> Vec<Step> {
@@ -184,7 +188,15 @@ pub(crate) fn from_staged<O: super::DataflowOperator>(staged: &super::Stage<O>) 
         }
     }
 
-    // TODO: mark as ready
+    // mark nodes as ready
+    // TODO: also mark other materialization?
+    // TODO: what about updates between full replay and ready?
+    for &ni in &staged.added {
+        steps.push(Step::Ready {
+            domain: staged.assigned_domain[&ni],
+            node: ni,
+        });
+    }
 
     steps
 }
